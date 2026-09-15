@@ -216,7 +216,15 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 		Image: s.Config().Container.Image,
 	}
 
+	// Begin aggregating historical resource usage for this server. This has to happen before
+	// the event listeners are registered below, otherwise the resource samples that arrive
+	// while the container starts would not be recorded.
+	s.recorder = newResourceRecorder(s.ID())
+	s.recorder.Start(s.Context())
+
 	if env, err := docker.New(s.ID(), &meta, envCfg); err != nil {
+		// The server is not usable, so do not leave the recorder running for it.
+		s.recorder.Stop()
 		return nil, err
 	} else {
 		s.Environment = env

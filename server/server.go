@@ -46,6 +46,10 @@ type Server struct {
 	resources   ResourceUsage
 	Environment environment.ProcessEnvironment `json:"-"`
 
+	// Collects and persists historical resource usage for this server so that the Panel can
+	// render the resource usage graphs.
+	recorder *ResourceRecorder
+
 	fs *filesystem.Filesystem
 
 	// Events emitted by the server instance.
@@ -106,11 +110,19 @@ func New(client remote.Client) (*Server, error) {
 	return &s, nil
 }
 
+// Recorder returns the historical resource usage recorder for this server.
+func (s *Server) Recorder() *ResourceRecorder {
+	return s.recorder
+}
+
 // CleanupForDestroy stops all running background tasks for this server that are
 // using the context on the server struct. This will cancel any running install
 // processes for the server as well.
 func (s *Server) CleanupForDestroy() {
 	s.CtxCancel()
+	// Wait for the resource recorder to shut down so that any data still held in memory is
+	// written to the database before the server object is discarded.
+	s.recorder.Stop()
 	s.Events().Destroy()
 	s.DestroyAllSinks()
 	s.Websockets().CancelAll()

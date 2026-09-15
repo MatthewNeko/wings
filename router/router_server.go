@@ -208,6 +208,12 @@ func deleteServer(c *gin.Context) {
 
 	s.CleanupForDestroy()
 
+	// The server is leaving this node, either because it has been deleted or because it has
+	// been transferred elsewhere, so its recorded resource usage is no longer relevant here.
+	if err := server.PurgeResourceStats(s.ID()); err != nil {
+		middleware.ExtractLogger(c).WithField("error", err).Warn("router: failed to purge recorded resource usage for server")
+	}
+
 	// Remove any pending remote file downloads for the server.
 	for _, dl := range downloader.ByServer(s.ID()) {
 		dl.Cancel()

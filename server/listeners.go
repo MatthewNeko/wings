@@ -110,6 +110,9 @@ func (s *Server) StartEventListeners() {
 								return
 							}
 							s.resources.UpdateStats(stats.Data)
+							// Feed the sample into the historical recorder so that it can be
+							// aggregated into the resource usage graphs shown in the Panel.
+							s.recorder.Add(stats.Data)
 							// If there is no disk space available at this point, trigger the server
 							// disk limiter logic which will start to stop the running instance.
 							if !s.Filesystem().HasSpaceAvailable(true) {

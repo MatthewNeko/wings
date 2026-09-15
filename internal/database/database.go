@@ -45,7 +45,7 @@ func Initialize() error {
 	if tx := db.Exec("PRAGMA journal_mode = MEMORY"); tx.Error != nil {
 		return errors.WithStack(tx.Error)
 	}
-	if err := db.AutoMigrate(&models.Activity{}); err != nil {
+	if err := db.AutoMigrate(&models.Activity{}, &models.ResourceStat{}); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -58,4 +58,11 @@ func Instance() *gorm.DB {
 		panic("database: attempt to access instance before initialized")
 	}
 	return db
+}
+
+// IsInitialized returns true when the database connection has been established. Callers that
+// may run before or without Initialize() being called should check this value rather than
+// relying on Instance(), which will panic if the database is not available.
+func IsInitialized() bool {
+	return db != nil
 }

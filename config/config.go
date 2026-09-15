@@ -252,7 +252,43 @@ type SystemConfiguration struct {
 
 	Transfers Transfers `yaml:"transfers"`
 
+	// Stats controls the collection of historical resource usage data for servers. This data
+	// powers the resource usage history graphs that are displayed in the Panel.
+	Stats StatsConfiguration `yaml:"stats"`
+
 	OpenatMode string `default:"auto" yaml:"openat_mode"`
+}
+
+// StatsConfiguration controls how Wings collects, aggregates, and retains historical resource
+// usage data. Data is aggregated in memory and then periodically written to the local SQLite
+// database, where the Panel reads it from when rendering the resource history graphs.
+type StatsConfiguration struct {
+	// Enabled controls whether Wings records historical resource usage at all. When this is
+	// disabled the Panel will not be able to display any resource usage history.
+	Enabled bool `default:"true" yaml:"enabled"`
+
+	// SampleInterval is the minimum number of seconds that must pass between two recorded
+	// samples for a single server. A value of 0 records every sample that Docker publishes,
+	// which is the default and is what gives the most accurate peak bandwidth readings.
+	//
+	// Setting this above 0 throttles sampling and is not recommended: Docker publishes stats
+	// roughly once a second, so a throttle that lines up with that cadence will occasionally
+	// drop a sample and widen the measurement window, which under-reports the peak. It only
+	// exists as an escape hatch for hosts that cannot afford the work of aggregating every
+	// sample.
+	SampleInterval int `default:"0" yaml:"sample_interval"`
+
+	// FlushInterval is the number of seconds between two writes of aggregated data to the
+	// local database. Lower values make the graphs fresher at the cost of more disk writes.
+	FlushInterval int `default:"30" yaml:"flush_interval"`
+
+	// MinuteRetentionHours is the number of hours that minute resolution buckets are retained
+	// for. This determines how far back the high resolution graphs can look.
+	MinuteRetentionHours int `default:"48" yaml:"minute_retention_hours"`
+
+	// HourRetentionHours is the number of hours that hour resolution buckets are retained for.
+	// This determines how far back the long term graphs, such as the seven day view, can look.
+	HourRetentionHours int `default:"720" yaml:"hour_retention_hours"`
 }
 
 type CrashDetection struct {
