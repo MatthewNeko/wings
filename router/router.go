@@ -128,6 +128,12 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 			backup.POST("/:backup/restore", postServerRestoreBackup)
 			backup.DELETE("/:backup", deleteServerBackup)
 		}
+
+		// Cloud drive backups: the panel schedules these, the daemon archives and
+		// uploads, and progress travels back over the remote API.
+		server.POST("/external-backups/:run", postServerExternalBackup)
+		server.DELETE("/external-backups/:run", deleteServerExternalBackup)
+		server.POST("/external-backups/configs/:config/test", postServerExternalBackupTest)
 	}
 
 	return router

@@ -25,10 +25,13 @@ type Client interface {
 	GetInstallationScript(ctx context.Context, uuid string) (InstallationScript, error)
 	GetServerConfiguration(ctx context.Context, uuid string) (ServerConfigurationResponse, error)
 	GetServers(context context.Context, perPage int) ([]RawServerData, error)
+	GetExternalBackupInit(ctx context.Context, server, run string) (ExternalBackupInit, error)
+	GetExternalBackupConfigInit(ctx context.Context, server, config string) (ExternalBackupInit, error)
 	ResetServersState(ctx context.Context) error
 	SetArchiveStatus(ctx context.Context, uuid string, successful bool) error
 	SetBackupStatus(ctx context.Context, backup string, data BackupRequest) error
 	SendRestorationStatus(ctx context.Context, backup string, successful bool) error
+	SendExternalBackupStatus(ctx context.Context, server, run string, data ExternalBackupStatus) error
 	SetInstallationStatus(ctx context.Context, uuid string, data InstallStatusRequest) error
 	SetTransferStatus(ctx context.Context, uuid string, successful bool) error
 	ValidateSftpCredentials(ctx context.Context, request SftpAuthRequest) (SftpAuthResponse, error)

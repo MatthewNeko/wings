@@ -198,23 +198,17 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 
 	fs := a.Filesystem.unixFS.UnixFS
 
-	// If we're specifically looking for only certain files, or have requested
-	// that certain files be ignored we'll update the callback function to reflect
-	// that request.
-	var callback walkFunc
-	if len(a.Files) == 0 && len(a.Ignore) > 0 {
-		i := ignore.CompileIgnoreLines(strings.Split(a.Ignore, "\n")...)
-		callback = a.callback(func(_ int, _, relative string, _ ufs.DirEntry) error {
-			if i.MatchesPath(relative) {
-				return SkipThis
-			}
-			return nil
-		})
-	} else if len(a.Files) > 0 {
-		callback = a.withFilesCallback()
-	} else {
-		callback = a.callback()
+	// Filters are composed instead of picked exclusively: an include list and an
+	// ignore list are allowed to overlap, and a file only lands in the archive
+	// when every filter accepts it.
+	var filters []walkFunc
+	if len(a.Ignore) > 0 {
+		filters = append(filters, ignoreFilter(a.Ignore))
 	}
+	if len(a.Files) > 0 {
+		filters = append(filters, a.filesFilter())
+	}
+	callback := a.callback(filters...)
 
 	// Open the base directory we were provided.
 	dirfd, name, closeFd, err := fs.SafePath(a.BaseDirectory)
@@ -281,9 +275,22 @@ func (a *Archive) callback(opts ...walkFunc) walkFunc {
 
 var SkipThis = errors.New("skip this")
 
-// Pushes only files defined in the Files key to the final archive.
-func (a *Archive) withFilesCallback() walkFunc {
-	return a.callback(func(_ int, _, relative string, _ ufs.DirEntry) error {
+// ignoreFilter rejects anything matching the gitignore style patterns in ignored.
+func ignoreFilter(ignored string) walkFunc {
+	i := ignore.CompileIgnoreLines(strings.Split(ignored, "\n")...)
+
+	return func(_ int, _, relative string, _ ufs.DirEntry) error {
+		if i.MatchesPath(relative) {
+			return SkipThis
+		}
+
+		return nil
+	}
+}
+
+// filesFilter pushes only files defined in the Files key to the final archive.
+func (a *Archive) filesFilter() walkFunc {
+	return func(_ int, _, relative string, _ ufs.DirEntry) error {
 		for _, f := range a.Files {
 			// Allow exact file matches, otherwise check if file is within a parent directory.
 			//
@@ -301,7 +308,7 @@ func (a *Archive) withFilesCallback() walkFunc {
 		}
 
 		return SkipThis
-	})
+	}
 }
 
 // Adds a given file path to the final archive being created.

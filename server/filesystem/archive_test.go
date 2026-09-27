@@ -84,6 +84,41 @@ func TestArchive_Stream(t *testing.T) {
 
 			g.Assert(files).Equal(expected)
 		})
+
+		// An include list used to swallow the ignore list outright, so a backup
+		// that selected a folder could never leave anything inside it out.
+		g.It("applies ignore patterns alongside an include list", func() {
+			g.Assert(fs.CreateDirectory("test", "/")).IsNil()
+
+			body := strings.NewReader("hello, world!\n")
+			g.Assert(fs.Write("test/keep.txt", body, body.Size(), 0o644)).IsNil()
+
+			body = strings.NewReader("cache me if you can\n")
+			g.Assert(fs.Write("test/skip.log", body, body.Size(), 0o644)).IsNil()
+
+			body = strings.NewReader("hello, world!\n")
+			g.Assert(fs.Write("other.txt", body, body.Size(), 0o644)).IsNil()
+
+			a := &Archive{
+				Filesystem: fs,
+				Files:      []string{"test"},
+				Ignore:     "*.log",
+			}
+
+			archivePath := filepath.Join(rfs.root, "ignore-and-files.tar.gz")
+			g.Assert(a.Create(context.Background(), archivePath)).IsNil()
+
+			genericFs, err := archives.FileSystem(context.Background(), archivePath, nil)
+			g.Assert(err).IsNil()
+
+			afs, ok := genericFs.(iofs.ReadDirFS)
+			g.Assert(ok).IsTrue()
+
+			files, err := getFiles(afs, ".")
+			g.Assert(err).IsNil()
+
+			g.Assert(files).Equal([]string{"test/keep.txt"})
+		})
 	})
 }
 
