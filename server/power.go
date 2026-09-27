@@ -137,12 +137,16 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 		}
 	}
 
+	// 记下这是人发起的停机：崩溃处理程序据此把正常停止排除在崩溃计数之外。
+	if action == PowerActionStop || action == PowerActionRestart || action == PowerActionTerminate {
+		s.crasher.MarkExpectedStop()
+	}
+
 	switch action {
 	case PowerActionStart:
 		if s.Environment.State() != environment.ProcessOfflineState {
 			return ErrIsRunning
 		}
-
 		// Run the pre-boot logic for the server before processing the environment start.
 		if err := s.onBeforeStart(actxCtx); err != nil {
 			return err

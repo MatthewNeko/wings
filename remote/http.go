@@ -32,6 +32,7 @@ type Client interface {
 	SetBackupStatus(ctx context.Context, backup string, data BackupRequest) error
 	SendRestorationStatus(ctx context.Context, backup string, successful bool) error
 	SendExternalBackupStatus(ctx context.Context, server, run string, data ExternalBackupStatus) error
+	SendCrashReport(ctx context.Context, server string, data CrashReport) (CrashDecision, error)
 	SetInstallationStatus(ctx context.Context, uuid string, data InstallStatusRequest) error
 	SetTransferStatus(ctx context.Context, uuid string, successful bool) error
 	ValidateSftpCredentials(ctx context.Context, request SftpAuthRequest) (SftpAuthResponse, error)
