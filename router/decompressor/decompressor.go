@@ -236,6 +236,13 @@ func (b *Batch) begin(index int) bool {
 	b.index = index
 	b.files[index].Status = StatusRunning
 
+	// Restart the speed sampling window for the archive that is about to start.
+	// Without this the first sample of the new file is measured against the byte
+	// count of the previous one, which reports a negative rate.
+	b.lastAt = time.Now()
+	b.lastBytes = 0
+	b.speed = 0
+
 	return true
 }
 
