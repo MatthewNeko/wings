@@ -33,7 +33,9 @@ var pool = sync.Pool{
 // TarProgress .
 type TarProgress struct {
 	*tar.Writer
-	p *progress.Progress
+	p       *progress.Progress
+	ctx     context.Context
+	onWrite func(n int64)
 }
 
 // NewTarProgress .
@@ -49,10 +51,42 @@ func NewTarProgress(w *tar.Writer, p *progress.Progress) *TarProgress {
 
 // Write .
 func (p *TarProgress) Write(v []byte) (int, error) {
-	if p.p == nil {
-		return p.Writer.Write(v)
+	if err := p.cancelled(); err != nil {
+		return 0, err
 	}
-	return p.p.Write(v)
+
+	var n int
+	var err error
+	if p.p == nil {
+		n, err = p.Writer.Write(v)
+	} else {
+		n, err = p.p.Write(v)
+	}
+	if err != nil {
+		return n, err
+	}
+
+	if p.onWrite != nil {
+		p.onWrite(int64(len(v)))
+	}
+
+	return n, nil
+}
+
+// cancelled reports whether the archive being written should give up. Checking on
+// every write is what makes cancellation work in the middle of a single huge file;
+// the walk in Stream only notices a cancel between files.
+func (p *TarProgress) cancelled() error {
+	if p.ctx == nil {
+		return nil
+	}
+
+	select {
+	case <-p.ctx.Done():
+		return p.ctx.Err()
+	default:
+		return nil
+	}
 }
 
 type Archive struct {
@@ -73,6 +107,12 @@ type Archive struct {
 
 	// Progress wraps the writer of the archive to pass through the progress tracker.
 	Progress *progress.Progress
+
+	// OnWrite, when set, is called with the size of every chunk handed to the tar
+	// writer. Because that is the uncompressed side of the stream, it reports how
+	// much of the source data has been consumed rather than how large the archive
+	// has grown, which is what a progress bar needs to be meaningful.
+	OnWrite func(n int64)
 
 	w *TarProgress
 }
@@ -143,7 +183,7 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 	// Create a new gzip writer around the file.
 	gw, _ := pgzip.NewWriterLevel(w, compressionLevel)
 	// Increase buffer size and goroutines for better performance with large files
-	_ = gw.SetConcurrency(4<<20, 4)  // 4MB buffer, 4 goroutines
+	_ = gw.SetConcurrency(4<<20, 4) // 4MB buffer, 4 goroutines
 	defer gw.Close()
 
 	// Create a new tar writer around the gzip writer.
@@ -151,6 +191,10 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 	defer tw.Close()
 
 	a.w = NewTarProgress(tw, a.Progress)
+	// The tar writer is the single choke point every file passes through, so the
+	// context and progress callback are attached here instead of at each call site.
+	a.w.ctx = ctx
+	a.w.onWrite = a.OnWrite
 
 	fs := a.Filesystem.unixFS.UnixFS
 

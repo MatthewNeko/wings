@@ -103,6 +103,14 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 			files.POST("/decompress", postServerDecompressFiles)
 			files.POST("/chmod", postServerChmodFile)
 
+			// Progress tracking for batch decompression.
+			files.GET("/decompress-progress", getDecompressProgress)
+			files.DELETE("/decompress-progress/:batch_id", deleteDecompressProgress)
+
+			// Progress tracking for background compression jobs.
+			files.GET("/compress-progress", getCompressProgress)
+			files.DELETE("/compress-progress/:job_id", deleteCompressProgress)
+
 			files.GET("/pull", middleware.RemoteDownloadEnabled(), getServerPullingFiles)
 			files.POST("/pull", middleware.RemoteDownloadEnabled(), postServerPullRemoteFile)
 			files.DELETE("/pull/:download", middleware.RemoteDownloadEnabled(), deleteServerPullRemoteFile)

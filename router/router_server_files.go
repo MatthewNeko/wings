@@ -20,6 +20,8 @@ import (
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/internal/models"
+	"github.com/pterodactyl/wings/router/compressor"
+	"github.com/pterodactyl/wings/router/decompressor"
 	"github.com/pterodactyl/wings/router/downloader"
 	"github.com/pterodactyl/wings/router/middleware"
 	"github.com/pterodactyl/wings/router/tokens"
@@ -395,19 +397,26 @@ func postServerCreateDirectory(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// postServerCompressFiles packs the given paths into a tar.gz archive. By default
+// it blocks until the archive is written and returns the resulting file stats, which
+// is what older panel versions expect. Passing "background": true instead registers
+// the job and returns immediately, letting the caller follow along through
+// getCompressProgress.
 func postServerCompressFiles(c *gin.Context) {
 	s := ExtractServer(c)
 
 	var data struct {
-		RootPath string   `json:"root"`
-		Files    []string `json:"files"`
+		RootPath   string   `json:"root"`
+		Files      []string `json:"files"`
+		Background bool     `json:"background"`
 	}
 
 	if err := c.BindJSON(&data); err != nil {
 		return
 	}
 
-	if len(data.Files) == 0 {
+	files := cleanArchivePaths(data.Files)
+	if len(files) == 0 {
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
 			"error": "No files were passed through to be compressed.",
 		})
@@ -421,7 +430,15 @@ func postServerCompressFiles(c *gin.Context) {
 		return
 	}
 
-	f, err := s.Filesystem().CompressFiles(data.RootPath, data.Files)
+	// Background mode lets the panel show progress for archives large enough that
+	// holding an HTTP request open for the whole compression would be risky.
+	if data.Background {
+		c.JSON(http.StatusAccepted, compressor.Start(s, data.RootPath, files).State())
+
+		return
+	}
+
+	f, err := s.Filesystem().CompressFiles(data.RootPath, files)
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
@@ -433,19 +450,95 @@ func postServerCompressFiles(c *gin.Context) {
 	})
 }
 
-// postServerDecompressFiles receives the HTTP request and starts the process
-// of unpacking an archive that exists on the server into the provided RootPath
-// for the server.
+// getCompressProgress returns the progress of a single compression job, or every
+// job tracked for this server when no job ID is provided.
+func getCompressProgress(c *gin.Context) {
+	s := middleware.ExtractServer(c)
+
+	id := c.Query("job_id")
+	if id == "" {
+		c.JSON(http.StatusOK, gin.H{"jobs": compressor.List(s.ID())})
+
+		return
+	}
+
+	j := extractCompressJob(c, s.ID(), id)
+	if j == nil {
+		return
+	}
+
+	c.JSON(http.StatusOK, j.State())
+}
+
+// deleteCompressProgress cancels a running compression. The archive is left in an
+// unusable state on purpose: the filesystem layer removes the truncated tar.gz, so
+// the only visible result is that packing simply stops.
+func deleteCompressProgress(c *gin.Context) {
+	j := extractCompressJob(c, middleware.ExtractServer(c).ID(), c.Param("job_id"))
+	if j == nil {
+		return
+	}
+
+	compressor.Cancel(j.ID())
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Compression cancelled successfully",
+		"id":      j.ID(),
+	})
+}
+
+// extractCompressJob resolves a job ID for the server on the request and aborts
+// with the matching error when that is not possible. It returns nil once an error
+// response has been written.
+func extractCompressJob(c *gin.Context, serverID string, id string) *compressor.Job {
+	if id == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "No job ID was provided."})
+
+		return nil
+	}
+
+	j := compressor.Get(id)
+	if j == nil {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Compression job not found."})
+
+		return nil
+	}
+
+	// Never hand out progress for an archive belonging to another server.
+	if j.ServerID() != serverID {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Compression job does not belong to this server."})
+
+		return nil
+	}
+
+	return j
+}
+
+// postServerDecompressFiles unpacks archives that exist on the server into the
+// provided root path. A single "file" is extracted synchronously, while a "files"
+// array starts a background batch that reports progress through
+// getDecompressProgress.
 func postServerDecompressFiles(c *gin.Context) {
 	var data struct {
-		RootPath string `json:"root"`
-		File     string `json:"file"`
+		RootPath string   `json:"root"`
+		File     string   `json:"file"`
+		Files    []string `json:"files"`
 	}
 	if err := c.BindJSON(&data); err != nil {
 		return
 	}
 
 	s := middleware.ExtractServer(c)
+
+	// A list of archives is handled as a batch: the extraction runs in the
+	// background and the caller polls for progress. This keeps the panel from
+	// holding a request open for as long as the biggest archive takes.
+	if files := cleanArchivePaths(data.Files); len(files) > 0 {
+		c.JSON(http.StatusAccepted, decompressor.Start(s, data.RootPath, files).State())
+
+		return
+	}
+
 	lg := middleware.ExtractLogger(c).WithFields(log.Fields{"root_path": data.RootPath, "file": data.File})
 
 	// Check if there's enough space for decompression. This uses a 5-second timeout
@@ -493,6 +586,87 @@ func postServerDecompressFiles(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// cleanArchivePaths strips the empty entries out of a list of archive names so
+// a sloppy payload does not kick off a pointless extraction job.
+func cleanArchivePaths(files []string) []string {
+	if len(files) == 0 {
+		return nil
+	}
+
+	cleaned := make([]string, 0, len(files))
+	for _, f := range files {
+		if f = strings.TrimSpace(f); f != "" {
+			cleaned = append(cleaned, f)
+		}
+	}
+
+	return cleaned
+}
+
+// getDecompressProgress returns the progress of a single decompression batch,
+// or every batch tracked for this server when no batch ID is provided.
+func getDecompressProgress(c *gin.Context) {
+	s := middleware.ExtractServer(c)
+
+	id := c.Query("batch_id")
+	if id == "" {
+		c.JSON(http.StatusOK, gin.H{"batches": decompressor.List(s.ID())})
+
+		return
+	}
+
+	b := extractDecompressBatch(c, s.ID(), id)
+	if b == nil {
+		return
+	}
+
+	c.JSON(http.StatusOK, b.State())
+}
+
+// deleteDecompressProgress cancels a running decompression batch. Archives that
+// were already extracted are left untouched, the batch simply stops working
+// through whatever was still queued.
+func deleteDecompressProgress(c *gin.Context) {
+	b := extractDecompressBatch(c, middleware.ExtractServer(c).ID(), c.Param("batch_id"))
+	if b == nil {
+		return
+	}
+
+	decompressor.Cancel(b.ID())
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Decompression batch cancelled successfully",
+		"id":      b.ID(),
+	})
+}
+
+// extractDecompressBatch resolves a batch ID for the server on the request and
+// aborts the request with the matching error when that is not possible. It
+// returns nil once an error response has been written.
+func extractDecompressBatch(c *gin.Context, serverID string, id string) *decompressor.Batch {
+	if id == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "No batch ID was provided."})
+
+		return nil
+	}
+
+	b := decompressor.Get(id)
+	if b == nil {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Decompression batch not found."})
+
+		return nil
+	}
+
+	// Never hand out progress for an archive belonging to another server.
+	if b.ServerID() != serverID {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Decompression batch does not belong to this server."})
+
+		return nil
+	}
+
+	return b
 }
 
 type chmodFile struct {

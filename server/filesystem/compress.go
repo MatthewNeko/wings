@@ -30,7 +30,20 @@ import (
 // and the compressed file will be placed at that location named
 // `archive-{date}.tar.gz`.
 func (fs *Filesystem) CompressFiles(dir string, paths []string) (ufs.FileInfo, error) {
+	return fs.compressFiles(context.Background(), dir, paths, nil)
+}
+
+// CompressFilesWithProgress behaves like CompressFiles, but reports the number of
+// source bytes handed to the archive after each write, and gives up as soon as ctx
+// is cancelled. A cancelled compression leaves a truncated tar.gz behind that looks
+// exactly like a real archive in the file list, so it is removed before returning.
+func (fs *Filesystem) CompressFilesWithProgress(ctx context.Context, dir string, paths []string, written func(n int64)) (ufs.FileInfo, error) {
+	return fs.compressFiles(ctx, dir, paths, written)
+}
+
+func (fs *Filesystem) compressFiles(ctx context.Context, dir string, paths []string, written func(n int64)) (ufs.FileInfo, error) {
 	a := &Archive{Filesystem: fs, BaseDirectory: dir, Files: paths}
+	a.OnWrite = written
 	d := path.Join(
 		dir,
 		fmt.Sprintf("archive-%s.tar.gz", strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", "")),
@@ -41,7 +54,10 @@ func (fs *Filesystem) CompressFiles(dir string, paths []string) (ufs.FileInfo, e
 	}
 	defer f.Close()
 	cw := ufs.NewCountedWriter(f)
-	if err := a.Stream(context.Background(), cw); err != nil {
+	if err := a.Stream(ctx, cw); err != nil {
+		if ctx.Err() != nil {
+			_ = fs.unixFS.Remove(d)
+		}
 		return nil, err
 	}
 	if !fs.unixFS.CanFit(cw.BytesWritten()) {
@@ -50,6 +66,75 @@ func (fs *Filesystem) CompressFiles(dir string, paths []string) (ufs.FileInfo, e
 	}
 	fs.unixFS.Add(cw.BytesWritten())
 	return f.Stat()
+}
+
+// archiveSizeBudget caps how long CompressSourceSize will spend enumerating the
+// source tree. It mirrors the budget used when inspecting an archive: bailing out
+// early only means the caller gets a partial total, which progress reporting
+// already copes with.
+const archiveSizeBudget = 5 * time.Second
+
+// CompressSourceSize returns the combined size of the files that an archive built
+// from paths inside dir would contain. Paths may name files or directories and are
+// resolved the same way Archive.Stream resolves them. This is best effort: entries
+// that cannot be read are skipped, and the walk gives up once the budget is spent.
+// A zero total simply means progress has to fall back to an indeterminate bar.
+func (fs *Filesystem) CompressSourceSize(ctx context.Context, dir string, paths []string) int64 {
+	var (
+		total    int64
+		deadline = time.Now().Add(archiveSizeBudget)
+	)
+
+	for _, p := range fs.normalizeArchivePaths(dir, paths) {
+		if ctx.Err() != nil {
+			break
+		}
+
+		fd, name, closeFd, err := fs.unixFS.SafePath(p)
+		if err != nil {
+			// Anything the archiver cannot reach will not end up in the archive
+			// either, so it does not belong in the total.
+			continue
+		}
+
+		_ = fs.unixFS.WalkDirat(fd, name, func(_ int, _, _ string, d ufs.DirEntry, err error) error {
+			if err != nil || d == nil || d.IsDir() {
+				return nil
+			}
+
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			total += info.Size()
+
+			if time.Now().After(deadline) {
+				return iofs.SkipAll
+			}
+
+			return nil
+		})
+		closeFd()
+	}
+
+	return total
+}
+
+// normalizeArchivePaths turns the root and file list a compress request carries into
+// the paths Archive.Stream will actually walk, so a size estimate and the resulting
+// archive always describe the same set of files.
+func (fs *Filesystem) normalizeArchivePaths(dir string, paths []string) []string {
+	base := strings.TrimPrefix(dir, "/")
+
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if root := fs.Path(); strings.HasPrefix(p, root) {
+			p = strings.TrimPrefix(strings.TrimPrefix(p, root), "/")
+		}
+		out = append(out, path.Join(base, p))
+	}
+
+	return out
 }
 
 func (fs *Filesystem) archiverFileSystem(ctx context.Context, p string) (iofs.FS, error) {
@@ -94,17 +179,17 @@ func (fs *Filesystem) archiverFileSystem(ctx context.Context, p string) (iofs.FS
 	return nil, archives.NoMatch
 }
 
-// SpaceAvailableForDecompression looks through a given archive and determines
-// if decompressing it would put the server over its allocated disk space limit.
-// To avoid long delays on large archives, this function will timeout after 5 seconds
-// and allow decompression to proceed (space will still be checked incrementally during extraction).
-func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir string, file string) error {
-	// Don't waste time trying to determine this if we know the server will have the space for
-	// it since there is no limit.
-	if fs.MaxDisk() <= 0 {
-		return nil
-	}
-
+// scanArchive walks the archive located at dir/file and calls visit with the
+// size of every entry in it. Visitors keep their own running totals because the
+// callers care about different things, and a directory entry is not something
+// worth accounting for uniformly: some archive readers report a directory as
+// being as large as everything inside it.
+//
+// Enumerating very large archives can take a long time, so the walk is bounded
+// by a five second budget. Once that budget is exhausted the partial total is
+// reported to the visitor without an error, which is still usable for both space
+// checks and progress reporting.
+func (fs *Filesystem) scanArchive(ctx context.Context, dir string, file string, visit func(size int64, isDir bool) error) error {
 	fsys, err := fs.archiverFileSystem(ctx, filepath.Join(dir, file))
 	if err != nil {
 		if errors.Is(err, archives.NoMatch) {
@@ -122,8 +207,7 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	var size atomic.Int64
-	err = iofs.WalkDir(fsys, ".", func(path string, d iofs.DirEntry, err error) error {
+	err = iofs.WalkDir(fsys, ".", func(_ string, d iofs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -139,20 +223,62 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 			if err != nil {
 				return err
 			}
-			if !fs.unixFS.CanFit(size.Add(info.Size())) {
-				return newFilesystemError(ErrCodeDiskSpace, nil)
-			}
-			return nil
+
+			return visit(info.Size(), d.IsDir())
 		}
 	})
 
-	// If the error is a timeout, ignore it and allow decompression to proceed.
-	// Space will still be checked incrementally during the actual extraction.
+	// If the error is a timeout, ignore it and report what we walked so far.
+	// Space is still checked incrementally during the actual extraction.
 	if errors.Is(err, context.DeadlineExceeded) {
 		return nil
 	}
 
 	return err
+}
+
+// SpaceAvailableForDecompression looks through a given archive and determines
+// if decompressing it would put the server over its allocated disk space limit.
+// To avoid long delays on large archives, this function will timeout after 5 seconds
+// and allow decompression to proceed (space will still be checked incrementally during extraction).
+func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir string, file string) error {
+	// Don't waste time trying to determine this if we know the server will have the space for
+	// it since there is no limit.
+	if fs.MaxDisk() <= 0 {
+		return nil
+	}
+
+	// Accumulate every entry, directories included, so the check stays as
+	// conservative as it has always been.
+	var size atomic.Int64
+
+	return fs.scanArchive(ctx, dir, file, func(entrySize int64, _ bool) error {
+		if !fs.unixFS.CanFit(size.Add(entrySize)) {
+			return newFilesystemError(ErrCodeDiskSpace, nil)
+		}
+
+		return nil
+	})
+}
+
+// UncompressedSize returns the amount of bytes the contents of the archive at
+// dir/file would occupy once fully extracted. Archives that cannot be enumerated
+// within the scan budget return the partial total rather than an error, since an
+// approximate total is still useful for reporting progress.
+func (fs *Filesystem) UncompressedSize(ctx context.Context, dir string, file string) (int64, error) {
+	var size atomic.Int64
+
+	err := fs.scanArchive(ctx, dir, file, func(entrySize int64, isDir bool) error {
+		// Directories hold no data of their own, and counting them here would
+		// leave extraction progress stuck well below 100%.
+		if !isDir {
+			size.Add(entrySize)
+		}
+
+		return nil
+	})
+
+	return size.Load(), err
 }
 
 // DecompressFile will decompress a file in a given directory by using the
@@ -161,6 +287,19 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 // zip-slip attack being attempted by validating that the final path is within
 // the server data directory.
 func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file string) error {
+	return fs.DecompressFileWithProgress(ctx, dir, file, nil, nil)
+}
+
+// DecompressFileWithProgress behaves exactly like DecompressFile, except that
+// every chunk of data written to the filesystem is reported back through the
+// written callback. This is what allows long extractions to surface progress to
+// the panel. The callback may be invoked from multiple goroutines at once, so
+// implementations need to be safe for concurrent use.
+//
+// Extraction is abandoned as soon as cancel is closed. This is only used by the
+// batch endpoint: the single archive endpoint passes nil so that an extraction
+// keeps running even if the panel stops watching it.
+func (fs *Filesystem) DecompressFileWithProgress(ctx context.Context, dir string, file string, written func(n int64), cancel <-chan struct{}) error {
 	f, err := fs.unixFS.Open(filepath.Join(dir, file))
 	if err != nil {
 		return err
@@ -181,6 +320,8 @@ func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file strin
 		Directory: dir,
 		Format:    format,
 		Reader:    input,
+		Written:   written,
+		Cancel:    cancel,
 	})
 }
 
@@ -209,6 +350,40 @@ type extractStreamOptions struct {
 	Format archives.Format
 	// Reader for the archive.
 	Reader io.Reader
+	// Written, when set, receives the size of every chunk written to the
+	// filesystem while the archive is being extracted.
+	Written func(n int64)
+	// Cancel, when set, aborts the extraction as soon as it is closed.
+	Cancel <-chan struct{}
+}
+
+// countingReader reports the number of bytes that flow through it. It is used
+// to track extraction progress without changing how the archive formats read
+// their contents.
+type countingReader struct {
+	reader  io.Reader
+	written func(n int64)
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.reader.Read(p)
+	if n > 0 {
+		c.written(int64(n))
+	}
+
+	return n, err
+}
+
+// cancelled reports whether the caller asked for this extraction to be stopped.
+// A nil Cancel channel simply never fires, which keeps callers that do not care
+// about cancellation working as they always have.
+func (e extractStreamOptions) cancelled() error {
+	select {
+	case <-e.Cancel:
+		return context.Canceled
+	default:
+		return nil
+	}
 }
 
 // decodeFilename attempts to decode a filename from an archive, automatically
@@ -273,6 +448,10 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 		// Read in 4 KB chunks
 		buf := make([]byte, 4096)
 		for {
+			if err := opts.cancelled(); err != nil {
+				return err
+			}
+
 			n, err := reader.Read(buf)
 			if n > 0 {
 
@@ -288,6 +467,10 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 
 				// Add to quota
 				fs.addDisk(int64(n))
+
+				if opts.Written != nil {
+					opts.Written(int64(n))
+				}
 			}
 
 			if err != nil {
@@ -306,6 +489,10 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 
 	// Decompress and extract archive
 	return ex.Extract(ctx, opts.Reader, func(ctx context.Context, f archives.FileInfo) error {
+		if err := opts.cancelled(); err != nil {
+			return err
+		}
+
 		// Decode the filename, converting from GBK to UTF-8 if necessary.
 		decodedName := decodeFilename(f.NameInArchive)
 		p := filepath.Join(opts.Directory, decodedName)
@@ -328,7 +515,15 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			return err
 		}
 		defer r.Close()
-		if err := fs.Write(p, r, f.Size(), f.Mode()); err != nil {
+
+		// Route the entry through a counting reader so callers can follow how
+		// far the extraction has progressed.
+		var src io.Reader = r
+		if opts.Written != nil {
+			src = &countingReader{reader: r, written: opts.Written}
+		}
+
+		if err := fs.Write(p, src, f.Size(), f.Mode()); err != nil {
 			return wrapError(err, opts.FileName)
 		}
 		// Update the file modification time to the one set in the archive.
