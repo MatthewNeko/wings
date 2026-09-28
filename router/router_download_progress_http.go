@@ -35,13 +35,13 @@ func getDownloadProgress(c *gin.Context) {
 			return
 		}
 
-		// Download exists but progress was cleaned up (completed or failed)
-		// Return last known state
+		// 下载对象还在内存里，说明 Execute 还没返回，进度事件只是被清理掉了。
+		// 这里不能硬说 completed：面板会照着这句话把没下完的文件记成成功。
 		c.JSON(http.StatusOK, gin.H{
 			"id":        downloadID,
 			"file_name": filepath.Base(dl.Path()),
 			"progress":  dl.Progress(),
-			"status":    "completed",
+			"status":    "downloading",
 			"timestamp": time.Now().Unix(),
 		})
 		return

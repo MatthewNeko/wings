@@ -21,6 +21,11 @@ import (
 	"github.com/pterodactyl/wings/server"
 )
 
+// progressRetention 是下载结束后进度事件继续可查的时间。
+// 面板是按分钟轮询的，下载几秒就结束、几秒后就把事件删掉的话，
+// 面板永远读不到终态，只能把已经下好的文件反复重下然后判死。
+const progressRetention = 10 * time.Minute
+
 var client *http.Client
 
 func init() {
@@ -293,7 +298,7 @@ func (dl *Download) Execute() error {
 	if err := dl.server.Filesystem().Write(p, r, contentLength, 0o644); err != nil {
 		progressEvent.Status = "failed"
 		progressTracker.Broadcast(progressEvent)
-		progressTracker.Remove(dl.Identifier)
+		time.AfterFunc(progressRetention, func() { progressTracker.Remove(dl.Identifier) })
 		return errors.WrapIf(err, "downloader: failed to write file to server directory")
 	}
 
@@ -308,11 +313,8 @@ func (dl *Download) Execute() error {
 	progressEvent.Status = "completed"
 	progressTracker.Broadcast(progressEvent)
 
-	// Clean up progress tracking after a short delay
-	go func() {
-		time.Sleep(5 * time.Second)
-		progressTracker.Remove(dl.Identifier)
-	}()
+	// 终态事件留一段时间，让下一次轮询读得到，之后再回收。
+	time.AfterFunc(progressRetention, func() { progressTracker.Remove(dl.Identifier) })
 
 	return nil
 }
