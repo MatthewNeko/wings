@@ -277,6 +277,14 @@ func (dl *Download) Execute() error {
 		progressEvent.Bytes = bytes
 		progressEvent.Speed = speed
 		progressEvent.Timestamp = time.Now().Unix()
+
+		// dl.progress 只由已废弃的 counter() 写过，所以 Progress() 一直是 0。
+		// 进度事件还没建立（连接中、等响应头）或已被回收时，
+		// 两个查询接口都会退回读这里，不同步的话面板只会看到一个不动的 0%。
+		dl.mu.Lock()
+		dl.progress = progressEvent.Progress
+		dl.mu.Unlock()
+
 		progressTracker.Broadcast(progressEvent)
 
 		if total > 0 {
@@ -311,6 +319,11 @@ func (dl *Download) Execute() error {
 		progressEvent.Progress = 1.0
 	}
 	progressEvent.Status = "completed"
+
+	dl.mu.Lock()
+	dl.progress = progressEvent.Progress
+	dl.mu.Unlock()
+
 	progressTracker.Broadcast(progressEvent)
 
 	// 终态事件留一段时间，让下一次轮询读得到，之后再回收。
