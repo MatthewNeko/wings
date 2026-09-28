@@ -259,6 +259,9 @@ func (dl *Download) Execute() error {
 		Timestamp: time.Now().Unix(),
 	}
 
+	// 记录已经打印过的 10% 档位：回调是每个数据块触发一次，不挡就会刷屏。
+	lastLoggedDecile := 0
+
 	progressWriter := NewProgressWriter(contentLength, func(bytes, total int64, speed int64) {
 		if total > 0 {
 			progressEvent.Progress = float64(bytes) / float64(total)
@@ -271,10 +274,12 @@ func (dl *Download) Execute() error {
 		progressEvent.Timestamp = time.Now().Unix()
 		progressTracker.Broadcast(progressEvent)
 
-		// Log progress at 10% intervals (only if we know the total)
 		if total > 0 {
-			progressPercent := int(progressEvent.Progress * 100)
-			if progressPercent%10 == 0 && progressPercent > 0 {
+			// 每跨过一个 10% 档位只记一行。旧写法是 int(progress*100)%10==0，
+			// 而回调是每个数据块都触发一次，于是 90.00%~90.99% 整段全部命中，
+			// 一个 modpack 几百个文件能刷出上万行 DEBUG。
+			if decile := int(progressEvent.Progress * 10); decile > lastLoggedDecile {
+				lastLoggedDecile = decile
 				log.WithFields(log.Fields{
 					"file":     dl.path,
 					"progress": fmt.Sprintf("%.2f%%", progressEvent.Progress*100),
